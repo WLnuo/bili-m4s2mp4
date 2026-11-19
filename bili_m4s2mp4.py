@@ -24,6 +24,7 @@ bili_m4s2mp4.py —— B站缓存视频批量合并工具
 """
 
 import argparse
+import datetime
 import json
 import os
 import re
@@ -32,6 +33,10 @@ import subprocess
 import sys
 
 __version__ = "1.0.0"
+LOG_NAME = "bili_m4s2mp4.log"
+
+# 当前生效的日志 Tee，供异常兜底时也能写入结束标记
+_active_tee = None
 
 ILLEGAL = re.compile(r'[\\/:*?"<>|\r\n\t]')
 MAX_NAME = 150                  # Windows 单文件名建议上限
@@ -75,6 +80,117 @@ def human_size(num):
         if abs(num) < 1024 or unit == "TB":
             return f"{num:.1f} {unit}" if unit != "B" else f"{num:.0f} {unit}"
         num /= 1024
+
+
+def console_will_close():
+    """
+    判断当前控制台窗口是否会在本进程退出后立刻消失（即双击启动）。
+
+    原理：Windows 下若控制台只挂着本进程一个，说明窗口是为这次运行新建的，
+    退出就会关掉。若从已有终端启动，控制台里至少还有 shell 本身（>=2 个）。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        buf = (ctypes.c_uint * 8)()
+        n = ctypes.windll.kernel32.GetConsoleProcessList(buf, 8)
+        return n == 1
+    except Exception:
+        return False
+
+
+def wait_exit():
+    """等用户按回车再退出，避免窗口一闪而过看不到结果。"""
+    try:
+        print()
+        input("按回车键退出...")
+    except (EOFError, KeyboardInterrupt, OSError):
+        pass
+
+
+class Tee:
+    """
+    把控制台输出同时写入日志文件。
+
+    只包装 write/flush，不动任何 print 调用点，所以现有输出逻辑一行都不用改。
+    写日志失败时静默退回纯控制台模式 —— 日志是附加功能，绝不能因为它出错
+    而中断真正的合并任务。
+    """
+
+    def __init__(self, stream, logfile):
+        self.stream = stream
+        self.logfile = logfile
+        self.broken = False
+        self.closed = False
+
+    def write(self, data):
+        try:
+            self.stream.write(data)
+        except Exception:
+            pass
+        if not self.broken:
+            try:
+                self.logfile.write(data)
+            except Exception:
+                self.broken = True     # 磁盘满/权限问题，后续不再尝试
+        return len(data)
+
+    def flush(self):
+        for f in (self.stream, self.logfile):
+            try:
+                f.flush()
+            except Exception:
+                pass
+
+    # 让 print(..., end=...) 之外的其他属性访问（isatty、encoding 等）走原 stream
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def open_log(path, dry_run):
+    """
+    打开日志文件，返回 (Tee 或 None, 日志路径或 None)。
+
+    --dry-run 只预览不落盘，所以不写日志文件（否则"不写任何文件"的承诺就破了）。
+    日志采用追加模式，多次运行不会互相覆盖。
+    """
+    if dry_run:
+        return None, None
+    try:
+        d = os.path.dirname(os.path.abspath(path))
+        if d:
+            os.makedirs(d, exist_ok=True)
+        f = open(path, "a", encoding="utf-8", errors="replace")
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        f.write(f"\n{'=' * 60}\n[{ts}] 开始运行 bili_m4s2mp4 v{__version__}\n")
+        return Tee(sys.stdout, f), path
+    except Exception:
+        # 目录不可写等情况：退回纯控制台，不影响合并
+        return None, None
+
+
+def close_log(tee, code):
+    """
+    写结束标记、还原 stdout、关闭文件。任何异常都不影响退出码。
+
+    可安全重复调用：main() 正常返回时调一次，异常兜底再调一次，
+    第二次直接跳过，不会写入重复的结束标记。
+    """
+    if tee is None or tee.closed:
+        return
+    tee.closed = True
+    try:
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tee.logfile.write(f"[{ts}] 运行结束，退出码 {code}\n")
+        tee.logfile.flush()
+        tee.logfile.close()
+    except Exception:
+        pass
+    try:
+        sys.stdout = tee.stream
+    except Exception:
+        pass
 
 
 def find_tools():
@@ -607,6 +723,10 @@ def main(argv=None):
                     help="只预览将生成什么，不写任何文件、不建目录")
     ap.add_argument("--list", action="store_true",
                     help="只列出发现的缓存目录和分段数，不做检查")
+    ap.add_argument("--log", nargs="?", const="auto", default="auto",
+                    metavar="PATH",
+                    help="处理日志: auto=写入 <root>/bili_m4s2mp4.log 追加(默认) / "
+                         "PATH=写到指定文件 / off=不记录")
     ap.add_argument("--version", action="version", version=f"bili_m4s2mp4 {__version__}")
     args = ap.parse_args(argv)
 
@@ -645,8 +765,20 @@ def main(argv=None):
     out_desc = "视频目录下 (top)" if args.out == "top" else "各分段目录内 (c)"
     guard = SpaceGuard(root)
 
+    # ---- 日志：默认写到 <root>/bili_m4s2mp4.log，追加模式
+    global _active_tee
+    tee, log_path = None, None
+    if args.log != "off":
+        lp = os.path.join(root, LOG_NAME) if args.log == "auto" else args.log
+        tee, log_path = open_log(lp, args.dry_run)
+        if tee is not None:
+            _active_tee = tee
+            sys.stdout = tee
+
     print(f"bili_m4s2mp4 v{__version__}")
     print(f"根目录: {root}")
+    if tee is not None:
+        print(f"日志: {os.path.abspath(log_path)}")
     print(f"命名: {args.mode} | 输出: {out_desc} | 弹幕: {args.danmaku} | "
           f"子文件夹: {args.subdir} | "
           f"搬运: {'是' if args.move else '否'} | 预览: {'是' if args.dry_run else '否'}")
@@ -761,8 +893,30 @@ def main(argv=None):
             print(f"      失败 {dstats['fail']}")
 
     bad = stats["fail"] or stats["nospace"] or dstats["fail"]
-    return 1 if bad else 0
+    code = 1 if bad else 0
+    close_log(tee, code)
+    return code
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _code = 0
+    try:
+        _code = main()
+    except KeyboardInterrupt:
+        print("\n[中断] 用户取消")
+        _code = 130
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        _code = 1
+    finally:
+        # 异常/中断路径下 main() 内部的 close_log 可能没执行到，这里兜底
+        close_log(_active_tee, _code)
+        # 双击运行时窗口会随进程退出立刻消失，暂停一下让人看清结果
+        if console_will_close():
+            print()
+            print("=" * 60)
+            print(f"运行结束，退出码 {_code}"
+                  f"（{'全部成功' if _code == 0 else '有失败或提示，见上方输出'}）")
+            wait_exit()
+    sys.exit(_code)
