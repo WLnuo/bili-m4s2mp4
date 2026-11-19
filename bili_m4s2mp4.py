@@ -37,6 +37,8 @@ LOG_NAME = "bili_m4s2mp4.log"
 
 # 当前生效的日志 Tee，供异常兜底时也能写入结束标记
 _active_tee = None
+# --pause 的取值（auto/on/off），由 main() 写入，退出时读取
+_pause_mode = "auto"
 
 ILLEGAL = re.compile(r'[\\/:*?"<>|\r\n\t]')
 MAX_NAME = 150                  # Windows 单文件名建议上限
@@ -82,22 +84,116 @@ def human_size(num):
         num /= 1024
 
 
+def _process_chain(max_depth=10):
+    """
+    返回当前进程的祖先链（进程名列表，从自身开始）。
+
+    用 CreateToolhelp32Snapshot 一次性快照全部进程，再顺着 ParentProcessID
+    往上走。不依赖 wmic / tasklist（部分系统上缺失），也不起子进程。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x2
+
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    k = ctypes.windll.kernel32
+    snap = k.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap == -1:
+        return []
+
+    table = {}
+    try:
+        e = PROCESSENTRY32()
+        e.dwSize = ctypes.sizeof(e)
+        if k.Process32First(snap, ctypes.byref(e)):
+            while True:
+                table[e.th32ProcessID] = (
+                    e.th32ParentProcessID,
+                    e.szExeFile.decode("mbcs", "replace").lower(),
+                )
+                if not k.Process32Next(snap, ctypes.byref(e)):
+                    break
+    finally:
+        k.CloseHandle(snap)
+
+    chain = []
+    pid = os.getpid()
+    seen = set()
+    for _ in range(max_depth):
+        if pid in seen or pid not in table:
+            break
+        seen.add(pid)
+        ppid, name = table[pid]
+        chain.append(name)
+        if ppid == 0 or ppid == pid:
+            break
+        pid = ppid
+    return chain
+
+
+# 出现这些进程，说明是从已有终端/IDE/宿主程序启动的，窗口不会随本进程退出而消失
+# 注意：不要放 explorer.exe（那是双击启动，窗口会消失）、
+#       也不要依赖开头的 python.exe（Store 别名转发，在判断前已单独剥离）
+_SHELLS = {
+    "cmd.exe", "powershell.exe", "pwsh.exe", "bash.exe", "sh.exe",
+    "zsh.exe", "fish.exe", "wt.exe", "windowsterminal.exe",
+    "mintty.exe", "git-bash.exe", "tmux.exe",
+    "code.exe", "pycharm64.exe", "pycharm.exe", "idea64.exe",
+    "sublime_text.exe", "notepad++.exe", "gvim.exe",
+    "python.exe",          # 被另一个 python 程序调用（定时任务、测试框架）
+    "sandbox-cli.exe",     # 各类集成终端的宿主
+    "workbuddy.exe",
+    "node.exe", "java.exe", "electron.exe",
+}
+
+
 def console_will_close():
     """
-    判断当前控制台窗口是否会在本进程退出后立刻消失（即双击启动）。
+    判断控制台窗口是否会随本进程退出而立刻关闭（即"双击启动"）。
 
-    原理：Windows 下若控制台只挂着本进程一个，说明窗口是为这次运行新建的，
-    退出就会关掉。若从已有终端启动，控制台里至少还有 shell 本身（>=2 个）。
+    踩过的坑（三个，都是实测踩出来的）：
+    1. 最早用 GetConsoleProcessList() 返回值 == 1 判断，在这台机器上失效 ——
+       Microsoft Store 版 python.exe 是"应用执行别名"，双击时会多一个转发
+       进程，进程数是 2 而不是 1，于是被当成"从终端启动"，窗口照样一闪而过。
+    2. 改成"链上没有终端就返回 False"，判断不出启动来源时反而不暂停，
+       正好把最需要暂停的双击场景漏掉了。
+    3. python.exe 放进 _SHELLS 后，Store 别名的转发进程（也叫 python.exe）
+       正好命中它，直接把结果判成"不暂停"。所以必须先剥掉开头这段。
+
+    最终策略（保守优先）：
+        先跳过开头连续的 python.exe（自己和 Store 别名转发进程）
+        再看剩下的祖先：有终端/IDE → 不暂停；其他全部情况 → 暂停
+    宁可让人多按一次回车，也不能让窗口闪掉看不见结果。
+    自动化场景可以显式加 --pause off。
     """
     if os.name != "nt":
         return False
     try:
-        import ctypes
-        buf = (ctypes.c_uint * 8)()
-        n = ctypes.windll.kernel32.GetConsoleProcessList(buf, 8)
-        return n == 1
+        chain = _process_chain()
+        # 剥掉自身以及 Store 别名转发造成的连续 python.exe
+        rest = chain[1:]
+        while rest and rest[0] == "python.exe":
+            rest.pop(0)
+        for name in rest:
+            if name in _SHELLS:
+                return False        # 由已有终端/IDE 启动
+        return True                 # 其余情况（explorer 拉起 / 链断裂 / 异常）一律暂停
     except Exception:
-        return False
+        return True                 # 判断本身失败时也暂停
 
 
 def wait_exit():
@@ -727,8 +823,14 @@ def main(argv=None):
                     metavar="PATH",
                     help="处理日志: auto=写入 <root>/bili_m4s2mp4.log 追加(默认) / "
                          "PATH=写到指定文件 / off=不记录")
+    ap.add_argument("--pause", choices=["auto", "on", "off"], default="auto",
+                    help="结束后是否暂停等回车: auto=双击时暂停(默认) / "
+                         "on=总是暂停 / off=从不暂停")
     ap.add_argument("--version", action="version", version=f"bili_m4s2mp4 {__version__}")
     args = ap.parse_args(argv)
+
+    global _pause_mode
+    _pause_mode = args.pause
 
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -905,6 +1007,9 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[中断] 用户取消")
         _code = 130
+    except SystemExit:
+        # argparse 的 --version / --help 走这里，直接放行
+        raise
     except Exception:
         import traceback
         traceback.print_exc()
@@ -913,7 +1018,7 @@ if __name__ == "__main__":
         # 异常/中断路径下 main() 内部的 close_log 可能没执行到，这里兜底
         close_log(_active_tee, _code)
         # 双击运行时窗口会随进程退出立刻消失，暂停一下让人看清结果
-        if console_will_close():
+        if _pause_mode == "on" or (_pause_mode == "auto" and console_will_close()):
             print()
             print("=" * 60)
             print(f"运行结束，退出码 {_code}"
