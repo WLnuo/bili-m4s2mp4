@@ -1,0 +1,42 @@
+# 字节码 / 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 本地产物与样本（不要提交真实缓存或合并出来的视频）
+*.mp4
+*.m4s
+*.flv
+c_*/
+_t/
+_v/
+_c/
+
+# Agent 工作记录，含本地路径，不入库
+.workbuddy/
+
+# 备份文件
+*.bak
+*.orig
+_backup/
